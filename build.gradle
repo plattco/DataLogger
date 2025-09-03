@@ -1,0 +1,163 @@
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.http.ResponseEntity;
+import java.util.Base64;
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import java.time.format.DateTimeFormatter;
+import java.time.LocalDate;
+import java.util.Map;
+import java.util.HashMap;
+
+@SpringBootApplication
+@RestController
+@RequestMapping("/api")
+public class PrLogger {
+
+    // IMPORTANT: Use environment variables for sensitive data.
+    // Do not hardcode your GitHub PAT.
+    private final String GITHUB_PAT = System.getenv("GITHUB_PAT");
+    private final String GITHUB_REPO_OWNER = "YOUR_GITHUB_USERNAME";
+    private final String GITHUB_REPO_NAME = "YOUR_REPO_NAME";
+    private final String FILE_PATH = "pr_log.md";
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final HttpClient httpClient = HttpClient.newHttpClient();
+
+    public static void main(String[] args) {
+        SpringApplication.run(PrLogger.class, args);
+    }
+
+    /**
+     * Data Transfer Object (DTO) for the incoming request body.
+     */
+    public static class PrEntry {
+        private String exercise;
+        private double weight;
+        private int reps;
+        private String date;
+
+        // Getters and Setters
+        public String getExercise() { return exercise; }
+        public void setExercise(String exercise) { this.exercise = exercise; }
+        public double getWeight() { return weight; }
+        public void setWeight(double weight) { this.weight = weight; }
+        public int getReps() { return reps; }
+        public void setReps(int reps) { this.reps = reps; }
+        public String getDate() { return date; }
+        public void setDate(String date) { this.date = date; }
+    }
+
+    /**
+     * Endpoint to receive the PR data from the front-end.
+     * It handles the logic for updating the GitHub file.
+     */
+    @PostMapping("/save-pr")
+    public ResponseEntity<String> savePrEntry(@RequestBody PrEntry entry) {
+        if (GITHUB_PAT == null || GITHUB_PAT.isEmpty()) {
+            return ResponseEntity.status(500).body("GitHub PAT is not set in environment variables.");
+        }
+
+        try {
+            // 1. Fetch the current content of the Markdown file from GitHub
+            Map<String, String> fileInfo = getFileFromGitHub(GITHUB_REPO_OWNER, GITHUB_REPO_NAME, FILE_PATH, GITHUB_PAT);
+            String existingContent = fileInfo.get("content");
+            String sha = fileInfo.get("sha");
+
+            // 2. Format the new PR entry as Markdown
+            String newEntryMarkdown = String.format("- **%s**: %.1f lbs for %d reps (Date: %s)%n",
+                    entry.getExercise(), entry.getWeight(), entry.getReps(), entry.getDate());
+
+            // 3. Combine existing content with the new entry
+            String newContent = existingContent + newEntryMarkdown;
+
+            // 4. Update the file on GitHub with the new content
+            updateFileOnGitHub(GITHUB_REPO_OWNER, GITHUB_REPO_NAME, FILE_PATH, newContent, sha, GITHUB_PAT);
+
+            return ResponseEntity.ok("PR entry successfully saved.");
+        } catch (IOException | InterruptedException e) {
+            e.printStackTrace();
+            return ResponseEntity.status(500).body("An error occurred: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Fetches the content and SHA of a file from a GitHub repository.
+     *
+     * @param owner The repository owner.
+     * @param repo The repository name.
+     * @param path The path to the file.
+     * @param pat The GitHub Personal Access Token.
+     * @return A map containing the file content and SHA.
+     */
+    private Map<String, String> getFileFromGitHub(String owner, String repo, String path, String pat)
+            throws IOException, InterruptedException {
+        String url = String.format("https://api.github.com/repos/%s/%s/contents/%s", owner, repo, path);
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", "token " + pat)
+                .header("Accept", "application/vnd.github.v3+json")
+                .GET()
+                .build();
+
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200) {
+            throw new IOException("Failed to get file from GitHub: " + response.body());
+        }
+
+        JsonNode jsonNode = objectMapper.readTree(response.body());
+        String contentBase64 = jsonNode.get("content").asText().replace("\n", "");
+        String content = new String(Base64.getDecoder().decode(contentBase64));
+        String sha = jsonNode.get("sha").asText();
+
+        Map<String, String> result = new HashMap<>();
+        result.put("content", content);
+        result.put("sha", sha);
+
+        return result;
+    }
+
+    /**
+     * Updates a file in a GitHub repository with new content.
+     *
+     * @param owner The repository owner.
+     * @param repo The repository name.
+     * @param path The path to the file.
+     * @param newContent The new content for the file.
+     * @param sha The SHA of the file being updated.
+     * @param pat The GitHub Personal Access Token.
+     */
+    private void updateFileOnGitHub(String owner, String repo, String path, String newContent, String sha, String pat)
+            throws IOException, InterruptedException {
+        String url = String.format("https://api.github.com/repos/%s/%s/contents/%s", owner, repo, path);
+        String encodedContent = Base64.getEncoder().encodeToString(newContent.getBytes());
+
+        Map<String, String> body = new HashMap<>();
+        body.put("message", "Add new PR entry for " + LocalDate.now().format(DateTimeFormatter.ISO_LOCAL_DATE));
+        body.put("content", encodedContent);
+        body.put("sha", sha);
+
+        String jsonBody = objectMapper.writeValueAsString(body);
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Authorization", "token " + pat)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/vnd.github.v3+json")
+                .PUT(HttpRequest.BodyPublishers.ofString(jsonBody))
+                .build();
+
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+        if (response.statusCode() != 200) {
+            throw new IOException("Failed to update file on GitHub: " + response.body());
+        }
+    }
+}
